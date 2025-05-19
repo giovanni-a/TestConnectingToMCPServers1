@@ -1,4 +1,6 @@
-﻿using Azure;
+﻿//#define EXECUTE_FUNCTION_CALLS_MANUALLY
+
+using Azure;
 using Azure.AI.OpenAI;
 using Microsoft.Extensions.AI;
 using ModelContextProtocol.Client;
@@ -44,7 +46,9 @@ IChatClient chatClient = openAIClient
     .GetChatClient(modelId)
     .AsIChatClient()
     .AsBuilder()
+#if !EXECUTE_FUNCTION_CALLS_MANUALLY
     .UseFunctionInvocation()
+#endif
     .Build();
 
 var transport = new SseClientTransport(new()
@@ -119,16 +123,14 @@ static async Task<ChatMessage> GetResponse(IChatClient chatClient, IMcpClient mc
     Console.WriteLine("\n=== CHAT HISTORY BEFORE PROCESSING ===");
     for (int i = 0; i < chatHistory.Count; i++)
     {
-        // Since ChatMessage doesn't have a Content property, use the standard ToString method
         Console.WriteLine($"[{i}] {chatHistory[i].Role}: {TruncateString(chatHistory[i].ToString(), 50)}");
     }
 
-    string finalResponse = "";
+    string initialResponse = "";
     UsageDetails? usageDetails = null;
 
     // Get the entire response in one go (no loop)
     var allFunctionCalls = new List<FunctionCallContent>();
-    string currentResponse = "";
 
     await foreach (var item in chatClient.GetStreamingResponseAsync(chatHistory, options))
     {
@@ -138,39 +140,44 @@ static async Task<ChatMessage> GetResponse(IChatClient chatClient, IMcpClient mc
         {
             allFunctionCalls.Add(functionCallContent);
             Console.ForegroundColor = ConsoleColor.Magenta;
-            Console.WriteLine($"\nFunction call found: {functionCallContent.Name} (Collecting, not executing yet)");
+            Console.WriteLine($"\nFunction call found: {functionCallContent.Name}");
         }
         else
         {
             // Regular text content
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.Write(item.Text);
-            currentResponse += item.Text;
+            initialResponse += item.Text;
         }
 
         var usage = item.Contents.OfType<UsageContent>().FirstOrDefault()?.Details;
         if (usage != null) usageDetails = usage;
     }
 
-    // Store the current assistant response even if we found function calls
-    finalResponse = currentResponse;
+    string finalResponse = initialResponse;
 
-    // If we found function calls, process them and return their responses only, without another AI call
+#if EXECUTE_FUNCTION_CALLS_MANUALLY
+    // If we found function calls, process them
     if (allFunctionCalls.Count > 0)
     {
         Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.WriteLine($"\nProcessing {allFunctionCalls.Count} function call(s) without adding to chat history yet");
-
-        // Process each function call sequentially
+        Console.WriteLine($"\nProcessing {allFunctionCalls.Count} function call(s)");
+        
+        // Create a new temporary chat history with the existing messages
+        var tempChatHistory = new List<ChatMessage>(chatHistory);
+        
+        // Add the assistant's initial response to the temporary history
+        tempChatHistory.Add(new ChatMessage(ChatRole.Assistant, initialResponse));
+        
+        // Process each function call and add results to the temporary history
         foreach (var functionCallContent in allFunctionCalls)
         {
             Console.WriteLine($"\nExecuting MCP tool: {functionCallContent.Name}");
-
             try
             {
                 // Get the arguments from the function call
                 var arguments = functionCallContent.Arguments as Dictionary<string, object>;
-
+                
                 // Display the arguments
                 if (arguments != null)
                 {
@@ -180,40 +187,73 @@ static async Task<ChatMessage> GetResponse(IChatClient chatClient, IMcpClient mc
                         Console.WriteLine($"  {arg.Key}: {arg.Value}");
                     }
                 }
-
+                
                 // Call the MCP tool
                 var toolResult = await mcpClient.CallToolAsync(
                     functionCallContent.Name,
                     arguments
                 );
-
+                
                 // Extract the text content from the result
                 var toolResponseText = string.Join("\n",
                     toolResult.Content
                         .Where(c => c.Type == "text")
                         .Select(c => c.Text));
-
+                
                 Console.ForegroundColor = ConsoleColor.Green;
                 Console.WriteLine($"Tool response: {toolResponseText}");
-
-                // Do NOT add to chat history yet
-                Console.WriteLine($"Tool response from {functionCallContent.Name} will be returned to the user directly");
-
-                // Append tool response to final response
-                finalResponse += $"\n\n**Results from {functionCallContent.Name}:**\n{toolResponseText}";
+                
+                // Format the tool response as a structured message
+                // Since ChatRole.Function is not available, use User role with a special format
+                var formattedToolResponse = $"Function Result from '{functionCallContent.Name}':\n{toolResponseText}";
+                tempChatHistory.Add(new ChatMessage(ChatRole.User, formattedToolResponse));
             }
             catch (Exception ex)
             {
                 Console.ForegroundColor = ConsoleColor.Red;
                 Console.WriteLine($"Error executing tool {functionCallContent.Name}: {ex.Message}");
-
-                // Append error to final response
-                finalResponse += $"\n\n**Error from {functionCallContent.Name}:**\n{ex.Message}";
+                
+                // Also create a message for errors
+                var errorMessage = $"Function Error from '{functionCallContent.Name}':\nError: {ex.Message}";
+                tempChatHistory.Add(new ChatMessage(ChatRole.User, errorMessage));
             }
         }
+        
+        // Make a second call to the model with the updated history including function results
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine("\nGetting final AI response with function results...");
+        
+        // Reset the final response to capture the new completion
+        finalResponse = "";
+        
+        await foreach (var item in chatClient.GetStreamingResponseAsync(tempChatHistory, options))
+        {
+            // We shouldn't get more function calls here, but handle them just in case
+            var functionCallContent = item.Contents.FirstOrDefault(c => c is FunctionCallContent) as FunctionCallContent;
+            if (functionCallContent != null)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"\nWarning: Another function call requested in second pass: {functionCallContent.Name} (ignoring)");
+                // Ignore nested function calls for simplicity
+            }
+            else
+            {
+                // Regular text content from final response
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.Write(item.Text);
+                finalResponse += item.Text;
+            }
+            
+            var usage = item.Contents.OfType<UsageContent>().FirstOrDefault()?.Details;
+            if (usage != null) usageDetails = usage;
+        }
+        
+        Console.ForegroundColor = ConsoleColor.Yellow;
+        Console.WriteLine("\nFinal response with function results integrated successfully!");
     }
+#endif
 
-    // Add only one final assistant response that includes both AI text and tool results
+    // Add only the final assistant response to the actual chat history
     var assistantMessage = new ChatMessage(ChatRole.Assistant, finalResponse);
     chatHistory.Add(assistantMessage);
 
@@ -225,7 +265,6 @@ static async Task<ChatMessage> GetResponse(IChatClient chatClient, IMcpClient mc
     Console.WriteLine("\n=== CHAT HISTORY AFTER PROCESSING ===");
     for (int i = 0; i < chatHistory.Count; i++)
     {
-        // Since ChatMessage doesn't have a Content property, use the standard ToString method
         Console.WriteLine($"[{i}] {chatHistory[i].Role}: {TruncateString(chatHistory[i].ToString(), 50)}");
     }
 
